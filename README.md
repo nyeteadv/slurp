@@ -49,6 +49,12 @@ Select a window under Sway, using `swaymsg` and `jq`:
 swaymsg -t get_tree | jq -r '.. | select(.pid? and .visible?) | .rect | "\(.x),\(.y) \(.width)x\(.height)"' | slurp
 ```
 
+Output just the x and y position, with a newline at the end (specific syntax for escaping newline works in bash and zsh but may not in other shells):
+
+```sh
+slurp -f $'%x %y\n'
+```
+
 ## Contributing
 
 Either [send GitHub pull requests][1] or [send patches on the mailing list][2].
