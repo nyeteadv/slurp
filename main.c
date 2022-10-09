@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <wayland-cursor.h>
 #include <xkbcommon/xkbcommon.h>
 #include <linux/input-event-codes.h>
@@ -17,31 +18,18 @@
 #define BG_COLOR 0xFFFFFF40
 #define BORDER_COLOR 0x000000FF
 #define SELECTION_COLOR 0x00000000
+#define CROSSAIR_COLOR 0x00FFFFFF
 #define FONT_FAMILY "sans-serif"
+#define FONT_SIZE 14
+#define FONT_COLOR 0xFFFFFFFF
+#define CHOICE_FONT_COLOR 0xFCBA03FF
+#define KEYBOAD_SELECTORS "abcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 static void noop() {
 	// This space intentionally left blank
 }
 
 static void set_output_dirty(struct slurp_output *output);
-
-bool box_intersect(const struct slurp_box *a, const struct slurp_box *b) {
-	return a->x < b->x + b->width &&
-		a->x + a->width > b->x &&
-		a->y < b->y + b->height &&
-		a->height + a->y > b->y;
-}
-
-static bool in_box(const struct slurp_box *box, int32_t x, int32_t y) {
-	return box->x <= x
-		&& box->x + box->width > x
-		&& box->y <= y
-		&& box->y + box->height > y;
-}
-
-static int32_t box_size(const struct slurp_box *box) {
-	return box->width * box->height;
-}
 
 static int max(int a, int b) {
 	return (a > b) ? a : b;
@@ -72,6 +60,7 @@ static void move_seat(struct slurp_seat *seat, wl_fixed_t surface_x,
 
 static void seat_update_selection(struct slurp_seat *seat) {
 	seat->pointer_selection.has_selection = false;
+	seat->keyboard_selection.has_selection = false;
 
 	// find smallest box intersecting the cursor
 	struct slurp_box *box;
@@ -91,12 +80,17 @@ static void seat_update_selection(struct slurp_seat *seat) {
 }
 
 static void seat_set_outputs_dirty(struct slurp_seat *seat) {
+	struct slurp_state *state = seat->state;
 	struct slurp_output *output;
 	wl_list_for_each(output, &seat->state->outputs, link) {
+		struct slurp_box *geometry = &output->logical_geometry;
 		if (box_intersect(&output->logical_geometry,
 			&seat->pointer_selection.selection) ||
 				box_intersect(&output->logical_geometry,
-			&seat->touch_selection.selection)) {
+			&seat->touch_selection.selection) ||
+				box_intersect(&output->logical_geometry,
+			&seat->keyboard_selection.selection) ||
+				(state->crosshair && in_box(geometry, seat->pointer_selection.x, seat->pointer_selection.y))) {
 			set_output_dirty(output);
 		}
 	}
@@ -136,7 +130,7 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
 	}
 
 	// the places the cursor moved away from are also dirty
-	if (seat->pointer_selection.has_selection) {
+	if (seat->pointer_selection.has_selection || seat->keyboard_selection.has_selection || seat->state->crosshair) {
 		seat_set_outputs_dirty(seat);
 	}
 
@@ -177,7 +171,7 @@ static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
 		uint32_t time, wl_fixed_t surface_x, wl_fixed_t surface_y) {
 	struct slurp_seat *seat = data;
 	// the places the cursor moved away from are also dirty
-	if (seat->pointer_selection.has_selection) {
+	if (seat->pointer_selection.has_selection || seat->keyboard_selection.has_selection || seat->state->crosshair) {
 		seat_set_outputs_dirty(seat);
 	}
 
@@ -192,7 +186,7 @@ static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
 		break;
 	}
 
-	if (seat->pointer_selection.has_selection) {
+	if (seat->pointer_selection.has_selection || seat->keyboard_selection.has_selection || seat->state->crosshair) {
 		seat_set_outputs_dirty(seat);
 	}
 }
@@ -291,6 +285,22 @@ static void recompute_selection(struct slurp_seat *seat) {
 	}
 }
 
+static void handle_keyboard_selection(struct slurp_seat *seat, char *key) {
+	seat->pointer_selection.has_selection = false;
+	seat->keyboard_selection.has_selection = false;
+
+	struct slurp_box *box;
+	wl_list_for_each(box, &seat->state->boxes, link) {
+		if (!box->label || strncmp(key, box->label, strlen(key)) != 0) {
+			continue;
+		}
+		seat->keyboard_selection.selection = *box;
+		seat->keyboard_selection.has_selection = true;
+		seat_set_outputs_dirty(seat);
+		break;
+	}
+}
+
 static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
 		const uint32_t serial, const uint32_t time, const uint32_t key,
 		const uint32_t key_state) {
@@ -301,6 +311,11 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
 	switch (key_state) {
 	case WL_KEYBOARD_KEY_STATE_PRESSED:
 		switch (keysym) {
+		case XKB_KEY_Return:
+			if (state->restrict_selection && seat->keyboard_selection.has_selection) {
+				handle_selection_start(seat, &seat->keyboard_selection);
+			}
+			break;
 		case XKB_KEY_Escape:
 			seat->pointer_selection.has_selection = false;
 			seat->touch_selection.has_selection = false;
@@ -322,6 +337,24 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
 				recompute_selection(seat);
 			}
 			break;
+		default:
+			if (state->restrict_selection && state->display_labels) {
+				char *pressed_key;
+				int key_size;
+				key_size = xkb_state_key_get_utf8(seat->xkb_state, key + 8, NULL, 0) + 1;
+				if (key_size) {
+					pressed_key = (char *) malloc(key_size * sizeof(char));
+					if (pressed_key == NULL) {
+						fprintf(stderr, "malloc failed\n");
+						exit(EXIT_FAILURE);
+					}
+					xkb_state_key_get_utf8(seat->xkb_state, key + 8, pressed_key, key_size);
+					if (strstr(KEYBOAD_SELECTORS, pressed_key) != NULL) {
+						handle_keyboard_selection(seat, pressed_key);
+					}
+					free(pressed_key);
+				}
+			}
 		}
 		break;
 
@@ -577,6 +610,7 @@ static void send_frame(struct slurp_output *output) {
 
 	cairo_identity_matrix(output->current_buffer->cairo);
 	cairo_scale(output->current_buffer->cairo, output->scale, output->scale);
+	cairo_translate(output->current_buffer->cairo, -output->logical_geometry.x, -output->logical_geometry.y);
 
 	render(output);
 
@@ -694,16 +728,23 @@ static const char usage[] =
 	"\n"
 	"  -h           Show help message and quit.\n"
 	"  -d           Display dimensions of selection.\n"
+	"  -l           Display labels of restricted selections.\n"
+	"  -L #rrggbbaa Set font color.\n"
 	"  -b #rrggbbaa Set background color.\n"
 	"  -c #rrggbbaa Set border color.\n"
+	"  -X #rrggbbaa Set crosshair color.\n"
 	"  -s #rrggbbaa Set selection color.\n"
+	"  -S #rrggbbaa Set font color of selected labels.\n"
 	"  -B #rrggbbaa Set option box color.\n"
 	"  -F s         Set the font family for the dimensions.\n"
+	"  -g n         Set font size.\n"
 	"  -w n         Set border weight.\n"
 	"  -f s         Set output format.\n"
 	"  -o           Select a display output.\n"
 	"  -p           Select a single point.\n"
 	"  -r           Restrict selection to predefined boxes.\n"
+	"  -m r:c       Split the predefined box or display into the given amount of rows and columns.\n"
+	"  -x           Enable crosshair.\n"
 	"  -a w:h       Force aspect ratio.\n";
 
 uint32_t parse_color(const char *color) {
@@ -818,6 +859,24 @@ static void add_choice_box(struct slurp_state *state,
 	wl_list_insert(state->boxes.prev, &b->link);
 }
 
+static void split_box_into(struct slurp_state *state, struct slurp_box *box, int rows, int cols) {
+				int row, col, i = 0;
+				for (row = 0; row < rows; row++) {
+					for (col = 0; col < cols; col++) {
+						struct slurp_box split_box = {0};
+						char label[2] = {'a', '\0'};
+						split_box.x = box->x + (box->width / cols) * col;
+						split_box.y = box->y + (box->height / rows) * row;
+						split_box.width = box->width / cols;
+						split_box.height = box->height / rows;
+						strncpy(label, &KEYBOAD_SELECTORS[i], 1);
+						split_box.label = label;
+						add_choice_box(state, &split_box);
+						i++;
+					}
+				}
+}
+
 int main(int argc, char *argv[]) {
 	int status = EXIT_SUCCESS;
 
@@ -831,26 +890,45 @@ int main(int argc, char *argv[]) {
 			.border = BORDER_COLOR,
 			.selection = SELECTION_COLOR,
 			.choice = BG_COLOR,
+			.font = FONT_COLOR,
+			.crosshair = CROSSAIR_COLOR,
+			.choice_font = CHOICE_FONT_COLOR,
 		},
 		.border_weight = 2,
 		.display_dimensions = false,
+		.display_labels = false,
 		.restrict_selection = false,
 		.fixed_aspect_ratio = false,
 		.aspect_ratio = 0,
-		.font_family = FONT_FAMILY
+		.crosshair = false,
+		.font_family = FONT_FAMILY,
+		.font_size = FONT_SIZE
 	};
 
 	int opt;
 	char *format = "%x,%y %wx%h\n";
 	bool output_boxes = false;
-	int w, h;
-	while ((opt = getopt(argc, argv, "hdb:c:s:B:w:proa:f:F:")) != -1) {
+	bool split_rows_cols = false;
+	int w, h, r, c;
+	while ((opt = getopt(argc, argv, "hdlb:X:m:L:S:c:s:B:w:g:prxoa:f:F:")) != -1) {
 		switch (opt) {
 		case 'h':
 			printf("%s", usage);
 			return EXIT_SUCCESS;
 		case 'd':
 			state.display_dimensions = true;
+			break;
+		case 'l':
+			state.display_labels = true;
+			break;
+		case 'L':
+			state.colors.font = parse_color(optarg);
+			break;
+		case 'X':
+			state.colors.crosshair = parse_color(optarg);
+			break;
+		case 'S':
+			state.colors.choice_font = parse_color(optarg);
 			break;
 		case 'b':
 			state.colors.background = parse_color(optarg);
@@ -869,6 +947,18 @@ int main(int argc, char *argv[]) {
 			break;
 		case 'F':
 			state.font_family = optarg;
+			break;
+		case 'x':
+			state.crosshair = true;
+			break;
+		case 'g':
+			errno = 0;
+			char *endptr;
+			state.font_size = strtol(optarg, &endptr, 10);
+			if (*endptr || errno) {
+				fprintf(stderr, "Error: expected numeric argument for -g\n");
+				exit(EXIT_FAILURE);
+			}
 			break;
 		case 'w': {
 			errno = 0;
@@ -889,6 +979,22 @@ int main(int argc, char *argv[]) {
 		case 'r':
 			state.restrict_selection = true;
 			break;
+		case 'm':
+			if (sscanf(optarg, "%d:%d", &r, &c) != 2) {
+				fprintf(stderr, "invalid format (must be rows:columns)\n");
+				return EXIT_FAILURE;
+			}
+			if (r <= 0 || c <= 0) {
+				fprintf(stderr, "number of rows and columns must be greater than zero\n");
+				return EXIT_FAILURE;
+			}
+			if ((uint32_t)(r * c) > strlen(KEYBOAD_SELECTORS)) {
+				fprintf(stderr, "rows times columns must not be greater than %zu\n", strlen(KEYBOAD_SELECTORS));
+				return EXIT_FAILURE;
+			}
+			split_rows_cols = true;
+			state.restrict_selection = true;
+			break;
 		case 'a':
 			if (sscanf(optarg, "%d:%d", &w, &h) != 2) {
 				fprintf(stderr, "invalid aspect ratio\n");
@@ -907,6 +1013,11 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
+	if (output_boxes && split_rows_cols) {
+		fprintf(stderr, "-m and -o cannot be used together\n");
+		return EXIT_FAILURE;
+	}
+
 	if (state.single_point && state.restrict_selection) {
 		fprintf(stderr, "-p and -r cannot be used together\n");
 		return EXIT_FAILURE;
@@ -922,6 +1033,11 @@ int main(int argc, char *argv[]) {
 					&in_box.width, &in_box.height, &in_box.label) < 4) {
 				fprintf(stderr, "invalid box format: %s\n", line);
 				return EXIT_FAILURE;
+			}
+			if (split_rows_cols) {
+				split_box_into(&state, &in_box, r, c);
+				free(in_box.label);
+				break;
 			}
 			add_choice_box(&state, &in_box);
 			free(in_box.label);
@@ -1038,6 +1154,13 @@ int main(int argc, char *argv[]) {
 		struct slurp_output *box_output;
 		wl_list_for_each(box_output, &state.outputs, link) {
 			add_choice_box(&state, &box_output->logical_geometry);
+		}
+	}
+
+	if (split_rows_cols && wl_list_empty(&state.boxes)) {
+		struct slurp_output *box_output;
+		wl_list_for_each(box_output, &state.outputs, link) {
+			split_box_into(&state, &box_output->logical_geometry, r, c);
 		}
 	}
 
